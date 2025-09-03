@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct Config {
     source_dir: Vec<String>,
     time_limit: u64,
+    black_list: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,8 +101,9 @@ fn read_config() -> Result<Config, Box<dyn std::error::Error>> {
 
         let home_dir = dirs::home_dir().unwrap();
         let default_config = Config {
-            source_dir: vec![format!("{}/Downloads/", home_dir.display())],
+            source_dir: vec![home_dir.join("Downloads").to_string_lossy().to_string()],
             time_limit: 20,
+            black_list: vec![],
         };
 
         let json_content = serde_json::to_string_pretty(&default_config)?;
@@ -123,8 +125,8 @@ fn read_config() -> Result<Config, Box<dyn std::error::Error>> {
 fn find_recent_files(config: &Config) -> Result<Vec<FileInfo>, Box<dyn std::error::Error>> {
     let mut files = Vec::new();
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-
     let time_limit_seconds = config.time_limit * 60;
+    let not_before = current_time - time_limit_seconds;
 
     // Iterate over source directories
     for source_dir in &config.source_dir {
@@ -132,47 +134,8 @@ fn find_recent_files(config: &Config) -> Result<Vec<FileInfo>, Box<dyn std::erro
         if !source_path.exists() {
             continue;
         }
-
-        let entries = fs::read_dir(source_path)?;
-
-        for entry in entries {
-            let entry = entry?;
-            let metadata = entry.metadata()?;
-
-            // Skip hidden files and directories
-            if entry.file_name().to_string_lossy().starts_with('.') {
-                continue;
-            }
-
-            if !metadata.is_file() {
-                continue;
-            }
-
-            // Check if file was created within the time limit
-            let created_time = metadata.created()?.duration_since(UNIX_EPOCH)?.as_secs();
-
-            if current_time - created_time <= time_limit_seconds {
-                let file_path = entry.path();
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                let size = metadata.len();
-
-                // Format creation time as HH:MM in local timezone
-                let created_datetime = chrono::DateTime::from_timestamp(created_time as i64, 0)
-                    .unwrap_or_default()
-                    .with_timezone(&chrono::Local);
-                let time_str = created_datetime.format("%H:%M").to_string();
-
-                files.push(FileInfo {
-                    path: file_path,
-                    name: file_name,
-                    size,
-                    created_time: time_str,
-                    created_timestamp: created_time,
-                    time_width: 5, // Will be updated later
-                    size_width: 8, // Will be updated later
-                });
-            }
-        }
+        // Recursively scan directories
+        scan_directory(source_path, config, &mut files, not_before)?;
     }
 
     // Sort by creation time (newest first)
@@ -198,6 +161,63 @@ fn find_recent_files(config: &Config) -> Result<Vec<FileInfo>, Box<dyn std::erro
     }
 
     Ok(files)
+}
+
+fn scan_directory(
+    dir_path: &Path,
+    config: &Config,
+    files: &mut Vec<FileInfo>,
+    not_before: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entries = fs::read_dir(dir_path)?;
+
+    for entry in entries {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        let file_name_str = entry.file_name().to_string_lossy().to_string();
+
+        // Skip if the path or file name contains any blacklisted string
+        if config.black_list.iter().any(|blacklisted| {file_name_str.contains(blacklisted)}) {
+            continue;
+        }
+
+        // Skip hidden files and directories
+        if file_name_str.starts_with('.') {
+            continue;
+        }
+
+        if metadata.is_file() {
+            // Check if file was created within the time limit
+            let created_time = metadata.created()?.duration_since(UNIX_EPOCH)?.as_secs();
+
+            if created_time >= not_before {
+                let file_path = entry.path();
+                let file_name = file_name_str;
+                let size = metadata.len();
+
+                // Format creation time as HH:MM in local timezone
+                let created_datetime = chrono::DateTime::from_timestamp(created_time as i64, 0)
+                    .unwrap_or_default()
+                    .with_timezone(&chrono::Local);
+                let time_str = created_datetime.format("%H:%M").to_string();
+
+                files.push(FileInfo {
+                    path: file_path,
+                    name: file_name,
+                    size,
+                    created_time: time_str,
+                    created_timestamp: created_time,
+                    time_width: 5, // Will be updated later
+                    size_width: 8, // Will be updated later
+                });
+            }
+        } else if metadata.is_dir() {
+            // Recursively scan subdirectories
+            scan_directory(&entry.path(), config, files, not_before)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn select_file(files: Vec<FileInfo>) -> Result<FileInfo, Box<dyn std::error::Error>> {
@@ -228,8 +248,24 @@ fn move_file(file_info: &FileInfo) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Move the file
-    fs::rename(&file_info.path, target_path)?;
+    // Copy the file
+    if let Err(copy_err) = fs::copy(&file_info.path, target_path) {
+        return Err(copy_err.into());
+    }
+    
+    // Remove the original file
+    if let Err(remove_err) = fs::remove_file(&file_info.path) {
+        println!(
+            "{}",
+            format!(
+                "File '{}' was copied, but failed to delete the original: {}",
+                file_info.name, remove_err
+            )
+            .yellow()
+        );
+        return Ok(())
+    }
+    
     println!(
         "{}",
         format!(
